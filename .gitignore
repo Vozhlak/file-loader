@@ -1,0 +1,32 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.out
+
+# Build artifacts
+bin/
+dist/
+build/
+_output/
+
+# Go specific
+go.sum
+go.work.sum
+
+# Editor and IDE
+.DS_Store
+*.swp
+*.swo
+*.tmp
+*~
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Logs and temporary files
+*.log
+*.temp
