@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
+	"sync"
 )
 
 func downloadFile(url, savePaths string) error {
@@ -28,7 +30,7 @@ func downloadFile(url, savePaths string) error {
 		return fmt.Errorf("не удалось определить имя файла из URL")
 	}
 
-	fullPath := path.Join(savePaths, filename)
+	fullPath := filepath.Join(savePaths, filename)
 
 	file, err := os.Create(fullPath)
 	if err != nil {
@@ -52,12 +54,28 @@ func main() {
 	}
 
 	savePath := os.Args[1]
-	url := os.Args[2]
+	urls := os.Args[2:]
 
-	fmt.Printf("Скачивание: %s\n", url)
+	wg := sync.WaitGroup{}
 
-	if err := downloadFile(url, savePath); err != nil {
-		fmt.Printf("Ошибка: %v\n", err)
-		os.Exit(1)
+	for _, url := range urls {
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+
+			name := path.Base(u)
+			fmt.Printf("Начало загрузки: %s\n", name)
+
+			if err := downloadFile(u, savePath); err != nil {
+				fmt.Printf("Ошибка: %v\n", err)
+				return
+			}
+
+			fmt.Printf("Завершено: %s\n", name)
+		}(url)
 	}
+
+	wg.Wait()
+	fmt.Println("Все файлы загружены!")
+
 }
