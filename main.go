@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"time"
 )
+
+var ErrRangeIgnored = errors.New("server ignored Range header")
 
 type FileMeta struct {
 	FileName     string
@@ -174,6 +177,38 @@ func downloadFile(client *http.Client, url, savePaths string) error {
 	return nil
 }
 
+func downloadChunk(client *http.Client, downloadUrl string, file *os.File, chunk Chunk) error {
+	req, err := http.NewRequest(http.MethodGet, downloadUrl, nil)
+	if err != nil {
+		return fmt.Errorf("не удалось создать запрос для чанка %d: %w", chunk.Index+1, err)
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", chunk.Start, chunk.End))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		return fmt.Errorf("%w: получили 200 OK вместо 206 Partial Content", ErrRangeIgnored)
+	}
+
+	if resp.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("ожидали 206 Partial Content, получили %d", resp.StatusCode)
+	}
+
+	if resp.Header.Get("Content-Range") == "" {
+		return fmt.Errorf("для чанка %d сервер не прислал Content-Range", chunk.Index+1)
+	}
+
+	if _, err = io.Copy(file, resp.Body); err != nil {
+		return fmt.Errorf("ошибка записи чанка %d: %w", chunk.Index+1, err)
+	}
+
+	return nil
+}
+
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Println("Использование: downloader <директория> <url1> [url2...]")
@@ -188,6 +223,7 @@ func main() {
 	}
 
 	wg := sync.WaitGroup{}
+	errCh := make(chan error, len(urls))
 
 	for _, rawUrl := range urls {
 		wg.Add(1)
@@ -216,24 +252,41 @@ func main() {
 			fmt.Printf("Количество чанков: %d\n", len(chunks))
 
 			if meta.AcceptRanges {
-				fmt.Println("  Докачка: поддерживается")
-				fmt.Printf("Начало загрузки...")
+				fmt.Println("Range-запросы: заявлены сервером (по HEAD)")
 			} else {
-				fmt.Println("  Докачка: не поддерживается")
-				fmt.Printf("Начало загрузки целиком...")
+				fmt.Println("Range-запросы: не заявлены сервером")
 			}
 
-			fmt.Println()
+			fmt.Println("Начало загрузки...")
 
 			for _, chunk := range chunks {
 				fmt.Printf(
-					"Чанк %d/%d: байты %d-%d\n",
+					"Загрузка чанка %d/%d: bytes=%d-%d",
 					chunk.Index+1,
 					len(chunks),
 					chunk.Start,
 					chunk.End,
 				)
+
+				err = downloadChunk(client, u, file, chunk)
+				if err != nil {
+					if errors.Is(err, ErrRangeIgnored) {
+						fmt.Println(" → 200 OK, сервер проигнорировал Range")
+					} else {
+						fmt.Printf(" → ошибка: %v\n", err)
+					}
+
+					file.Close()
+					_ = os.Remove(fullPath)
+
+					errCh <- fmt.Errorf("загрузка %s прервана: %w", meta.FileName, err)
+					return
+				}
+
+				fmt.Printf(" → %d %s\n", http.StatusPartialContent, http.StatusText(http.StatusPartialContent))
 			}
+
+			fmt.Printf("Завершено: %s\n", meta.FileName)
 
 			//if err = downloadFile(client, u, savePath); err != nil {
 			//	fmt.Printf("Ошибка: %v\n", err)
@@ -245,6 +298,19 @@ func main() {
 	}
 
 	wg.Wait()
-	fmt.Println("Все файлы загружены!")
+	close(errCh)
 
+	hadErrors := false
+	for err := range errCh {
+		if err != nil {
+			hadErrors = true
+			fmt.Printf("Ошибка: %v\n", err)
+		}
+	}
+
+	if hadErrors {
+		fmt.Println("Загрузка завершена с ошибками.")
+	} else {
+		fmt.Println("Все файлы успешно загружены!")
+	}
 }
