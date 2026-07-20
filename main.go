@@ -202,8 +202,21 @@ func downloadChunk(client *http.Client, downloadUrl string, file *os.File, chunk
 		return fmt.Errorf("для чанка %d сервер не прислал Content-Range", chunk.Index+1)
 	}
 
-	if _, err = io.Copy(file, resp.Body); err != nil {
+	offset, err := file.Seek(chunk.Start, io.SeekStart)
+	if err != nil {
+		return fmt.Errorf("не удалось перейти к позиции %d для чанка %d: %w", chunk.Start, chunk.Index+1, err)
+	}
+
+	if offset != chunk.Start {
+		return fmt.Errorf("неожиданная позиция после seek: ожидали %d, получили %d", chunk.Start, offset)
+	}
+
+	written, err := io.Copy(file, resp.Body)
+	if err != nil {
 		return fmt.Errorf("ошибка записи чанка %d: %w", chunk.Index+1, err)
+	}
+	if written != chunk.Size {
+		return fmt.Errorf("неполная запись чанка %d: ожидали %d байт, записали %d", chunk.Index+1, chunk.Size, written)
 	}
 
 	return nil
@@ -236,7 +249,7 @@ func main() {
 				return
 			}
 
-			fullPath := path.Join(savePath, meta.FileName)
+			fullPath := filepath.Join(savePath, meta.FileName)
 
 			file, err := createSparseFile(fullPath, meta.FileSize)
 			if err != nil {
