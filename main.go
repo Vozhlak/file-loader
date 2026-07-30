@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +28,13 @@ type Chunk struct {
 	Start int64
 	End   int64
 	Size  int64
+}
+
+type DownloadState struct {
+	URL         string `json:"url"`
+	TotalSize   int64  `json:"total_size"`
+	ChunkSize   int    `json:"chunk_size"`
+	TotalChunks int    `json:"total_chunks"`
 }
 
 const chunkSize = 10 * 1024 * 1024 // 10 MB
@@ -259,6 +267,28 @@ func main() {
 			defer file.Close()
 
 			chunks := buildChunks(meta.FileSize, chunkSize)
+
+			progressPath := fullPath + ".progress"
+
+			state := DownloadState{
+				URL:         u,
+				TotalSize:   meta.FileSize,
+				ChunkSize:   chunkSize,
+				TotalChunks: len(chunks),
+			}
+
+			data, err := json.MarshalIndent(state, "", "  ")
+			if err != nil {
+				errCh <- fmt.Errorf("не удалось сериализовать состояние для %s: %w", meta.FileName, err)
+				return
+			}
+
+			if err = os.WriteFile(progressPath, data, 0644); err != nil {
+				errCh <- fmt.Errorf("не удалось записать файл состояния для %s: %w", meta.FileName, err)
+				return
+			}
+
+			fmt.Printf("Создан файл состояния: %s\n", progressPath)
 
 			fmt.Printf("Файл: %s (%d байт)\n", meta.FileName, meta.FileSize)
 			fmt.Printf("Размер чанка: %d байт\n", chunkSize)
