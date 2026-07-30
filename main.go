@@ -268,17 +268,9 @@ func main() {
 			}
 
 			fullPath := filepath.Join(savePath, meta.FileName)
-
-			file, err := createSparseFile(fullPath, meta.FileSize)
-			if err != nil {
-				fmt.Printf("Ошибка подготовки файла %s: %v\n", meta.FileName, err)
-				return
-			}
-			defer file.Close()
+			progressPath := fullPath + ".progress"
 
 			chunks := buildChunks(meta.FileSize, chunkSize)
-
-			progressPath := fullPath + ".progress"
 
 			state := DownloadState{
 				URL:              u,
@@ -288,9 +280,51 @@ func main() {
 				DownloadedChunks: make([]bool, len(chunks)),
 			}
 
-			if err = saveProgress(progressPath, state); err != nil {
-				errCh <- fmt.Errorf("не удалось записать файл состояния для %s: %w", meta.FileName, err)
+			var file *os.File
+			var resume bool
+
+			if _, err = os.Stat(progressPath); err == nil {
+				data, err := os.ReadFile(progressPath)
+				if err != nil {
+					errCh <- fmt.Errorf("не удалось прочитать файл состояния %s: %w", progressPath, err)
+					return
+				}
+
+				if err = json.Unmarshal(data, &state); err != nil {
+					errCh <- fmt.Errorf("не удалось восстановить состояние из %s: %w", progressPath, err)
+					return
+				}
+
+				file, err = os.OpenFile(fullPath, os.O_RDWR, 0644)
+				if err != nil {
+					errCh <- fmt.Errorf("не удалось открыть файл для докачки %s: %w", fullPath, err)
+					return
+				}
+				resume = true
+				fmt.Println("Найден файл состояния, возобновляем загрузку...")
+			} else if os.IsNotExist(err) {
+				file, err = createSparseFile(fullPath, meta.FileSize)
+				if err != nil {
+					fmt.Printf("Ошибка подготовки файла %s: %v\n", meta.FileName, err)
+					return
+				}
+				if err = saveProgress(progressPath, state); err != nil {
+					errCh <- fmt.Errorf("не удалось записать файл состояния для %s: %w", meta.FileName, err)
+					return
+				}
+				fmt.Printf("Создан файл состояния: %s\n", progressPath)
+			} else {
+				errCh <- fmt.Errorf("не удалось проверить файл состояния %s: %w", progressPath, err)
 				return
+			}
+
+			defer file.Close()
+
+			if resume {
+				if err = file.Truncate(meta.FileSize); err != nil {
+					errCh <- fmt.Errorf("не удалось восстановить размер файла %s: %w", fullPath, err)
+					return
+				}
 			}
 
 			fmt.Printf("Создан файл состояния: %s\n", progressPath)
@@ -315,6 +349,11 @@ func main() {
 					chunk.Start,
 					chunk.End,
 				)
+
+				if state.DownloadedChunks[chunk.Index] {
+					fmt.Printf("Чанк %d уже загружен, пропускаем\n", chunk.Index+1)
+					continue
+				}
 
 				err = downloadChunk(client, u, file, chunk)
 				if err != nil {
