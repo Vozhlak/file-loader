@@ -31,10 +31,11 @@ type Chunk struct {
 }
 
 type DownloadState struct {
-	URL         string `json:"url"`
-	TotalSize   int64  `json:"total_size"`
-	ChunkSize   int    `json:"chunk_size"`
-	TotalChunks int    `json:"total_chunks"`
+	URL              string `json:"url"`
+	TotalSize        int64  `json:"total_size"`
+	ChunkSize        int    `json:"chunk_size"`
+	TotalChunks      int    `json:"total_chunks"`
+	DownloadedChunks []bool `json:"downloaded_chunks"`
 }
 
 const chunkSize = 10 * 1024 * 1024 // 10 MB
@@ -230,6 +231,15 @@ func downloadChunk(client *http.Client, downloadUrl string, file *os.File, chunk
 	return nil
 }
 
+func saveProgress(progressPath string, state DownloadState) error {
+	data, err := json.MarshalIndent(state, "", " ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(progressPath, data, 0644)
+}
+
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Println("Использование: downloader <директория> <url1> [url2...]")
@@ -271,19 +281,14 @@ func main() {
 			progressPath := fullPath + ".progress"
 
 			state := DownloadState{
-				URL:         u,
-				TotalSize:   meta.FileSize,
-				ChunkSize:   chunkSize,
-				TotalChunks: len(chunks),
+				URL:              u,
+				TotalSize:        meta.FileSize,
+				ChunkSize:        chunkSize,
+				TotalChunks:      len(chunks),
+				DownloadedChunks: make([]bool, len(chunks)),
 			}
 
-			data, err := json.MarshalIndent(state, "", "  ")
-			if err != nil {
-				errCh <- fmt.Errorf("не удалось сериализовать состояние для %s: %w", meta.FileName, err)
-				return
-			}
-
-			if err = os.WriteFile(progressPath, data, 0644); err != nil {
+			if err = saveProgress(progressPath, state); err != nil {
 				errCh <- fmt.Errorf("не удалось записать файл состояния для %s: %w", meta.FileName, err)
 				return
 			}
@@ -326,7 +331,24 @@ func main() {
 					return
 				}
 
+				if err = file.Sync(); err != nil {
+					errCh <- fmt.Errorf("не удалось синхронизировать файл %s: %w", meta.FileName, err)
+					return
+				}
+
+				state.DownloadedChunks[chunk.Index] = true
+
+				if err = saveProgress(progressPath, state); err != nil {
+					errCh <- fmt.Errorf("не удалось записать файл состояния для %s: %w", meta.FileName, err)
+					return
+				}
+
 				fmt.Printf(" → %d %s\n", http.StatusPartialContent, http.StatusText(http.StatusPartialContent))
+			}
+
+			if err = os.Remove(progressPath); err != nil && !os.IsNotExist(err) {
+				errCh <- fmt.Errorf("не удалось удалить файл состояния %s: %w", progressPath, err)
+				return
 			}
 
 			fmt.Printf("Завершено: %s\n", meta.FileName)
