@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -39,6 +40,8 @@ type DownloadState struct {
 }
 
 const chunkSize = 10 * 1024 * 1024 // 10 MB
+const maxRetries = 3
+const retryDelay = 2 * time.Second
 
 func detectFileName(resp *http.Response) string {
 	contentDisposition := resp.Header.Get("Content-Disposition")
@@ -240,6 +243,40 @@ func saveProgress(progressPath string, state DownloadState) error {
 	return os.WriteFile(progressPath, data, 0644)
 }
 
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, ErrRangeIgnored) {
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		// timeout почти всегда ретрабелен
+		if netErr.Timeout() {
+			return true
+		}
+		// Temporary устаревающий по смыслу, но для учебной задачи ок как сигнал временной ошибки
+		if netErr.Temporary() {
+			return true
+		}
+	}
+
+	var statusCode int
+	if _, scanErr := fmt.Sscanf(err.Error(), "ожидали 206 Partial Content, получили %d", &statusCode); scanErr == nil {
+		if statusCode >= 400 && statusCode < 500 {
+			return false
+		}
+		if statusCode >= 500 {
+			return true
+		}
+	}
+
+	return true
+}
+
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Println("Использование: downloader <директория> <url1> [url2...]")
@@ -256,21 +293,25 @@ func main() {
 	wg := sync.WaitGroup{}
 	errCh := make(chan error, len(urls))
 
-	for _, rawUrl := range urls {
+	for _, rawURL := range urls {
 		wg.Add(1)
 		go func(u string) {
 			defer wg.Done()
 
 			meta, err := FetchMetaData(client, u)
 			if err != nil {
-				fmt.Printf("Ошибка для %s: %v\n", u, err)
+				errCh <- fmt.Errorf("ошибка для %s: %w", u, err)
 				return
 			}
 
 			fullPath := filepath.Join(savePath, meta.FileName)
 			progressPath := fullPath + ".progress"
-
 			chunks := buildChunks(meta.FileSize, chunkSize)
+
+			if len(chunks) == 0 {
+				errCh <- fmt.Errorf("не удалось построить чанки для %s", meta.FileName)
+				return
+			}
 
 			state := DownloadState{
 				URL:              u,
@@ -290,8 +331,28 @@ func main() {
 					return
 				}
 
-				if err = json.Unmarshal(data, &state); err != nil {
+				if err := json.Unmarshal(data, &state); err != nil {
 					errCh <- fmt.Errorf("не удалось восстановить состояние из %s: %w", progressPath, err)
+					return
+				}
+
+				if state.TotalChunks != len(chunks) {
+					errCh <- fmt.Errorf(
+						"некорректный файл состояния %s: total_chunks=%d, ожидалось %d",
+						progressPath,
+						state.TotalChunks,
+						len(chunks),
+					)
+					return
+				}
+
+				if len(state.DownloadedChunks) != len(chunks) {
+					errCh <- fmt.Errorf(
+						"некорректный файл состояния %s: downloaded_chunks=%d, ожидалось %d",
+						progressPath,
+						len(state.DownloadedChunks),
+						len(chunks),
+					)
 					return
 				}
 
@@ -300,18 +361,22 @@ func main() {
 					errCh <- fmt.Errorf("не удалось открыть файл для докачки %s: %w", fullPath, err)
 					return
 				}
+
 				resume = true
-				fmt.Println("Найден файл состояния, возобновляем загрузку...")
+				fmt.Printf("Найден файл состояния, возобновляем загрузку: %s\n", progressPath)
 			} else if os.IsNotExist(err) {
 				file, err = createSparseFile(fullPath, meta.FileSize)
 				if err != nil {
-					fmt.Printf("Ошибка подготовки файла %s: %v\n", meta.FileName, err)
+					errCh <- fmt.Errorf("ошибка подготовки файла %s: %w", meta.FileName, err)
 					return
 				}
+
 				if err = saveProgress(progressPath, state); err != nil {
+					file.Close()
 					errCh <- fmt.Errorf("не удалось записать файл состояния для %s: %w", meta.FileName, err)
 					return
 				}
+
 				fmt.Printf("Создан файл состояния: %s\n", progressPath)
 			} else {
 				errCh <- fmt.Errorf("не удалось проверить файл состояния %s: %w", progressPath, err)
@@ -327,8 +392,6 @@ func main() {
 				}
 			}
 
-			fmt.Printf("Создан файл состояния: %s\n", progressPath)
-
 			fmt.Printf("Файл: %s (%d байт)\n", meta.FileName, meta.FileSize)
 			fmt.Printf("Размер чанка: %d байт\n", chunkSize)
 			fmt.Printf("Количество чанков: %d\n", len(chunks))
@@ -342,32 +405,60 @@ func main() {
 			fmt.Println("Начало загрузки...")
 
 			for _, chunk := range chunks {
+				if state.DownloadedChunks[chunk.Index] {
+					fmt.Printf("Чанк %d/%d уже загружен, пропускаем\n", chunk.Index+1, len(chunks))
+					continue
+				}
+
 				fmt.Printf(
-					"Загрузка чанка %d/%d: bytes=%d-%d",
+					"Загрузка чанка %d/%d: bytes=%d-%d\n",
 					chunk.Index+1,
 					len(chunks),
 					chunk.Start,
 					chunk.End,
 				)
 
-				if state.DownloadedChunks[chunk.Index] {
-					fmt.Printf("Чанк %d уже загружен, пропускаем\n", chunk.Index+1)
-					continue
-				}
+				var chunkErr error
 
-				err = downloadChunk(client, u, file, chunk)
-				if err != nil {
-					if errors.Is(err, ErrRangeIgnored) {
-						fmt.Println(" → 200 OK, сервер проигнорировал Range")
-					} else {
-						fmt.Printf(" → ошибка: %v\n", err)
+				for attempt := 0; attempt < maxRetries; attempt++ {
+					chunkErr = downloadChunk(client, u, file, chunk)
+					if chunkErr == nil {
+						break
 					}
 
-					file.Close()
-					_ = os.Remove(fullPath)
+					if !isRetryableError(chunkErr) {
+						fmt.Printf(
+							"Чанк %d/%d: постоянная ошибка, повторять бессмысленно: %v\n",
+							chunk.Index+1,
+							len(chunks),
+							chunkErr,
+						)
+						break
+					}
 
-					errCh <- fmt.Errorf("загрузка %s прервана: %w", meta.FileName, err)
-					return
+					if attempt < maxRetries-1 {
+						fmt.Printf(
+							"Чанк %d/%d: ошибка: %v\n  Повторная попытка через %v (%d/%d)...\n",
+							chunk.Index+1,
+							len(chunks),
+							chunkErr,
+							retryDelay,
+							attempt+1,
+							maxRetries,
+						)
+						time.Sleep(retryDelay)
+					}
+				}
+
+				if chunkErr != nil {
+					fmt.Printf(
+						"Чанк %d/%d: не удалось загрузить после %d попыток: %v\n",
+						chunk.Index+1,
+						len(chunks),
+						maxRetries,
+						chunkErr,
+					)
+					continue
 				}
 
 				if err = file.Sync(); err != nil {
@@ -382,23 +473,27 @@ func main() {
 					return
 				}
 
-				fmt.Printf(" → %d %s\n", http.StatusPartialContent, http.StatusText(http.StatusPartialContent))
+				fmt.Printf("Чанк %d/%d: готово\n", chunk.Index+1, len(chunks))
 			}
 
-			if err = os.Remove(progressPath); err != nil && !os.IsNotExist(err) {
-				errCh <- fmt.Errorf("не удалось удалить файл состояния %s: %w", progressPath, err)
-				return
+			allDownloaded := true
+			for _, downloaded := range state.DownloadedChunks {
+				if !downloaded {
+					allDownloaded = false
+					break
+				}
 			}
 
-			fmt.Printf("Завершено: %s\n", meta.FileName)
-
-			//if err = downloadFile(client, u, savePath); err != nil {
-			//	fmt.Printf("Ошибка: %v\n", err)
-			//	return
-			//}
-			//
-			//fmt.Printf("Завершено: %s\n", name)
-		}(rawUrl)
+			if allDownloaded {
+				if err = os.Remove(progressPath); err != nil && !os.IsNotExist(err) {
+					errCh <- fmt.Errorf("не удалось удалить файл состояния %s: %w", progressPath, err)
+					return
+				}
+				fmt.Printf("Завершено: %s\n", meta.FileName)
+			} else {
+				fmt.Printf("Загрузка %s завершена не полностью, состояние сохранено в %s\n", meta.FileName, progressPath)
+			}
+		}(rawURL)
 	}
 
 	wg.Wait()
