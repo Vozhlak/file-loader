@@ -645,20 +645,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	rootCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	firstSignalCh := make(chan os.Signal, 1)
 	signal.Notify(firstSignalCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(firstSignalCh)
 
-	forceExitCh := make(chan os.Signal, 1)
-	signal.Notify(forceExitCh, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(forceExitCh)
-
 	go func() {
 		<-firstSignalCh
+
 		fmt.Fprintln(os.Stderr, "\nПолучен сигнал остановки. Завершаем текущие операции... Нажмите Ctrl+C ещё раз для принудительного выхода.")
+		cancel()
+
+		forceExitCh := make(chan os.Signal, 1)
+		signal.Notify(forceExitCh, os.Interrupt, syscall.SIGTERM)
+		defer signal.Stop(forceExitCh)
 
 		<-forceExitCh
 		fmt.Fprintln(os.Stderr, "\nПолучен повторный сигнал. Принудительное завершение.")
