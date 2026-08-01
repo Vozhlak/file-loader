@@ -42,6 +42,7 @@ type DownloadState struct {
 const chunkSize = 10 * 1024 * 1024 // 10 MB
 const maxRetries = 3
 const retryDelay = 2 * time.Second
+const maxConcurrentChunks = 8
 
 func detectFileName(resp *http.Response) string {
 	contentDisposition := resp.Header.Get("Content-Disposition")
@@ -67,14 +68,6 @@ func detectFileName(resp *http.Response) string {
 
 func FetchMetaData(client *http.Client, rawURL string) (FileMeta, error) {
 	downloadURL := rawURL
-
-	if isYandexDiskPublicURL(rawURL) {
-		href, err := resolveYandexPublicDownloadURL(client, rawURL)
-		if err != nil {
-			return FileMeta{}, err
-		}
-		downloadURL = href
-	}
 
 	resp, err := client.Head(downloadURL)
 	if err != nil {
@@ -277,6 +270,164 @@ func isRetryableError(err error) bool {
 	return true
 }
 
+func downloadChunkData(client *http.Client, downloadURL string, chunk Chunk) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось создать запрос для чанка %d: %w", chunk.Index+1, err)
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", chunk.Start, chunk.End))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		return nil, fmt.Errorf("%w: получили 200 OK вместо 206 Partial Content", ErrRangeIgnored)
+	}
+
+	if resp.StatusCode != http.StatusPartialContent {
+		return nil, fmt.Errorf("ожидали 206 Partial Content, получили %d", resp.StatusCode)
+	}
+
+	if resp.Header.Get("Content-Range") == "" {
+		return nil, fmt.Errorf("для чанка %d сервер не прислал Content-Range", chunk.Index+1)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось прочитать тело чанка %d: %w", chunk.Index+1, err)
+	}
+
+	if int64(len(data)) != chunk.Size {
+		return nil, fmt.Errorf("неполный чанк %d: ожидали %d байт, получили %d", chunk.Index+1, chunk.Size, len(data))
+	}
+
+	return data, nil
+}
+
+func downloadChunkWithRetry(client *http.Client, downloadURL string, chunk Chunk) ([]byte, error) {
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		data, err := downloadChunkData(client, downloadURL, chunk)
+		if err == nil {
+			return data, nil
+		}
+
+		lastErr = err
+
+		if !isRetryableError(err) {
+			return nil, err
+		}
+
+		if attempt < maxRetries-1 {
+			fmt.Printf(
+				"Чанк %d: ошибка: %v\n  Повторная попытка через %v (%d/%d)...\n",
+				chunk.Index+1,
+				err,
+				retryDelay,
+				attempt+1,
+				maxRetries,
+			)
+			time.Sleep(retryDelay)
+		}
+	}
+
+	return nil, lastErr
+}
+
+func writeChunk(file *os.File, chunk Chunk, data []byte, fileMu *sync.Mutex) error {
+	fileMu.Lock()
+	defer fileMu.Unlock()
+
+	written, err := file.WriteAt(data, chunk.Start)
+	if err != nil {
+		return fmt.Errorf("ошибка записи чанка %d: %w", chunk.Index+1, err)
+	}
+
+	if int64(written) != chunk.Size {
+		return fmt.Errorf("неполная запись чанка %d: ожидали %d байт, записали %d", chunk.Index+1, chunk.Size, written)
+	}
+
+	if err = file.Sync(); err != nil {
+		return fmt.Errorf("не удалось синхронизировать файл после чанка %d: %w", chunk.Index+1, err)
+	}
+
+	return nil
+}
+
+func markChunkDownloaded(state *DownloadState, chunk Chunk, progressPath string, stateMu *sync.Mutex) error {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+
+	state.DownloadedChunks[chunk.Index] = true
+
+	if err := saveProgress(progressPath, *state); err != nil {
+		return fmt.Errorf("не удалось сохранить прогресс для чанка %d: %w", chunk.Index+1, err)
+	}
+
+	return nil
+}
+
+func isAllChunksDownloaded(state *DownloadState) bool {
+	for _, downloaded := range state.DownloadedChunks {
+		if !downloaded {
+			return false
+		}
+	}
+
+	return true
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+
+	return b
+}
+
+func chunkWorker(
+	workerID int,
+	jobs <-chan Chunk,
+	client *http.Client,
+	downloadURL string,
+	file *os.File,
+	state *DownloadState,
+	progressPath string,
+	fileMu *sync.Mutex,
+	stateMu *sync.Mutex,
+	totalChunks int,
+	wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for chunk := range jobs {
+		data, err := downloadChunkWithRetry(client, downloadURL, chunk)
+		if err != nil {
+			if !isRetryableError(err) {
+				fmt.Printf("[Worker %d] Чанк %d/%d: постоянная ошибка: %v\n", workerID, chunk.Index+1, totalChunks, err)
+			} else {
+				fmt.Printf("[Worker %d] Чанк %d/%d: не удалось загрузить после %d попыток: %v\n", workerID, chunk.Index+1, totalChunks, maxRetries, err)
+			}
+			continue
+		}
+
+		if err = writeChunk(file, chunk, data, fileMu); err != nil {
+			fmt.Printf("[Worker %d] Чанк %d/%d: ошибка записи: %v\n", workerID, chunk.Index+1, totalChunks, err)
+			continue
+		}
+
+		if err = markChunkDownloaded(state, chunk, progressPath, stateMu); err != nil {
+			fmt.Printf("[Worker %d] Чанк %d/%d: ошибка сохранения прогресса: %v\n", workerID, chunk.Index+1, totalChunks, err)
+			continue
+		}
+
+		fmt.Printf("[Worker %d] Чанк %d/%d загружен\n", workerID, chunk.Index+1, totalChunks)
+	}
+}
+
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Println("Использование: downloader <директория> <url1> [url2...]")
@@ -402,89 +553,43 @@ func main() {
 				fmt.Println("Range-запросы: не заявлены сервером")
 			}
 
-			fmt.Println("Начало загрузки...")
+			workerCount := min(maxConcurrentChunks, len(chunks))
+			fmt.Printf("Запуск %d воркеров...\n", workerCount)
+
+			jobs := make(chan Chunk)
+			var workerWG sync.WaitGroup
+			var fileMu sync.Mutex
+			var stateMu sync.Mutex
+
+			for w := 1; w <= workerCount; w++ {
+				workerWG.Add(1)
+				go chunkWorker(
+					w,
+					jobs,
+					client,
+					u,
+					file,
+					&state,
+					progressPath,
+					&fileMu,
+					&stateMu,
+					len(chunks),
+					&workerWG,
+				)
+			}
 
 			for _, chunk := range chunks {
 				if state.DownloadedChunks[chunk.Index] {
 					fmt.Printf("Чанк %d/%d уже загружен, пропускаем\n", chunk.Index+1, len(chunks))
 					continue
 				}
-
-				fmt.Printf(
-					"Загрузка чанка %d/%d: bytes=%d-%d\n",
-					chunk.Index+1,
-					len(chunks),
-					chunk.Start,
-					chunk.End,
-				)
-
-				var chunkErr error
-
-				for attempt := 0; attempt < maxRetries; attempt++ {
-					chunkErr = downloadChunk(client, u, file, chunk)
-					if chunkErr == nil {
-						break
-					}
-
-					if !isRetryableError(chunkErr) {
-						fmt.Printf(
-							"Чанк %d/%d: постоянная ошибка, повторять бессмысленно: %v\n",
-							chunk.Index+1,
-							len(chunks),
-							chunkErr,
-						)
-						break
-					}
-
-					if attempt < maxRetries-1 {
-						fmt.Printf(
-							"Чанк %d/%d: ошибка: %v\n  Повторная попытка через %v (%d/%d)...\n",
-							chunk.Index+1,
-							len(chunks),
-							chunkErr,
-							retryDelay,
-							attempt+1,
-							maxRetries,
-						)
-						time.Sleep(retryDelay)
-					}
-				}
-
-				if chunkErr != nil {
-					fmt.Printf(
-						"Чанк %d/%d: не удалось загрузить после %d попыток: %v\n",
-						chunk.Index+1,
-						len(chunks),
-						maxRetries,
-						chunkErr,
-					)
-					continue
-				}
-
-				if err = file.Sync(); err != nil {
-					errCh <- fmt.Errorf("не удалось синхронизировать файл %s: %w", meta.FileName, err)
-					return
-				}
-
-				state.DownloadedChunks[chunk.Index] = true
-
-				if err = saveProgress(progressPath, state); err != nil {
-					errCh <- fmt.Errorf("не удалось записать файл состояния для %s: %w", meta.FileName, err)
-					return
-				}
-
-				fmt.Printf("Чанк %d/%d: готово\n", chunk.Index+1, len(chunks))
+				jobs <- chunk
 			}
 
-			allDownloaded := true
-			for _, downloaded := range state.DownloadedChunks {
-				if !downloaded {
-					allDownloaded = false
-					break
-				}
-			}
+			close(jobs)
+			workerWG.Wait()
 
-			if allDownloaded {
+			if isAllChunksDownloaded(&state) {
 				if err = os.Remove(progressPath); err != nil && !os.IsNotExist(err) {
 					errCh <- fmt.Errorf("не удалось удалить файл состояния %s: %w", progressPath, err)
 					return
